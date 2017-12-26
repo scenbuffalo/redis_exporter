@@ -70,12 +70,17 @@ var (
 		"mem_fragmentation_ratio": "memory_fragmentation_ratio",
 
 		// # Persistence
+		"rdb_bgsave_in_progress":       "rdb_bgsave_in_progress",
+		"rdb_last_bgsave_status":       "rdb_last_bgsave_status",
+		"rdb_last_cow_size":            "rdb_last_cow_size",
 		"rdb_changes_since_last_save":  "rdb_changes_since_last_save",
 		"rdb_last_bgsave_time_sec":     "rdb_last_bgsave_duration_sec",
 		"rdb_current_bgsave_time_sec":  "rdb_current_bgsave_duration_sec",
 		"aof_enabled":                  "aof_enabled",
+		"aof_last_cow_size":            "aof_last_cow_size",
 		"aof_rewrite_in_progress":      "aof_rewrite_in_progress",
 		"aof_rewrite_scheduled":        "aof_rewrite_scheduled",
+		"aof_last_bgrewrite_status":    "aof_last_bgrewrite_status",
 		"aof_last_rewrite_time_sec":    "aof_last_rewrite_duration_sec",
 		"aof_current_rewrite_time_sec": "aof_current_rewrite_duration_sec",
 
@@ -97,9 +102,13 @@ var (
 		"latest_fork_usec":           "latest_fork_usec",
 
 		// # Replication
+		"replication_role":           "replication_role",
+		"slave_max_lag":              "slave_max_lag",
 		"loading":                    "loading_dump_file",
 		"connected_slaves":           "connected_slaves",
 		"repl_backlog_size":          "replication_backlog_bytes",
+		"repl_backlog_util":          "repl_backlog_util",
+		"repl_slave_max_lag":         "repl_slave_max_lag",
 		"master_last_io_seconds_ago": "master_last_io_seconds",
 		"master_repl_offset":         "master_repl_offset",
 
@@ -114,7 +123,7 @@ var (
 		"cluster_stats_messages_received": "cluster_messages_received_total",
 	}
 
-	instanceInfoFields = map[string]bool{"role": true, "redis_version": true, "redis_build_id": true, "redis_mode": true, "os": true}
+	instanceInfoFields = map[string]bool{"redis_version": true, "redis_build_id": true, "redis_mode": true, "os": true}
 	slaveInfoFields    = map[string]bool{"master_host": true, "master_port": true, "slave_read_only": true}
 )
 
@@ -344,11 +353,8 @@ func parseDBKeyspaceString(db string, stats string) (keysTotal float64, keysExpi
 	slave0:ip=10.254.11.1,port=6379,state=online,offset=1751844676,lag=0
 	slave1:ip=10.254.11.2,port=6379,state=online,offset=1751844222,lag=0
 */
-func parseConnectedSlaveString(slaveName string, slaveInfo string) (offset float64, ip string, state string, ok bool) {
+func parseConnectedSlaveString(slaveName string, slaveInfo string) (offset float64, ip string, state string, lag float64, ok bool) {
 	ok = false
-	if matched, _ := regexp.MatchString(`^slave\d+`, slaveName); !matched {
-		return
-	}
 	connectedSlaveInfo := make(map[string]string)
 	for _, kvPart := range strings.Split(slaveInfo, ",") {
 		x := strings.Split(kvPart, "=")
@@ -358,8 +364,13 @@ func parseConnectedSlaveString(slaveName string, slaveInfo string) (offset float
 		}
 		connectedSlaveInfo[x[0]] = x[1]
 	}
-	offset, err := strconv.ParseFloat(connectedSlaveInfo["offset"], 64)
-	if err != nil {
+	lag, err1 := strconv.ParseFloat(connectedSlaveInfo["lag"], 64)
+	if err1 != nil {
+		log.Debugf("Can not parse connected slave lag, got: %s", connectedSlaveInfo["lag"])
+		return
+	}
+	offset, err2 := strconv.ParseFloat(connectedSlaveInfo["offset"], 64)
+	if err2 != nil {
 		log.Debugf("Can not parse connected slave offset, got: %s", connectedSlaveInfo["offset"])
 		return
 	}
@@ -399,6 +410,14 @@ func (e *Exporter) extractInfoMetrics(info, addr string, alias string, scrapes c
 
 	instanceInfo := map[string]string{}
 	slaveInfo := map[string]string{}
+	var isMaster = false
+	var slaveOffsetArray [] float64
+	var slaveLagArray [] float64
+	var slaveOffsetTmp float64 = 0.0
+	var slaveIp string = ""
+	var slaveState string = ""
+	var master_repl_offset int64 = 0
+	var repl_backlog_size  int64 = 0
 	for _, line := range lines {
 		log.Debugf("info: %s", line)
 		if len(line) > 0 && line[0] == '#' {
@@ -424,6 +443,16 @@ func (e *Exporter) extractInfoMetrics(info, addr string, alias string, scrapes c
 			continue
 		}
 
+		if split[0] == "role" {
+			if split[1] == "master" {
+				isMaster = true
+				scrapes <- scrapeResult{Name: "replication_role", Addr: addr, Alias: "replication_role", Value: 1}
+			} else {
+				scrapes <- scrapeResult{Name: "replication_role", Addr: addr, Alias: "replication_role", Value: 0}
+			}
+			continue
+		}
+
 		if split[0] == "master_link_status" {
 			e.metricsMtx.RLock()
 			if split[1] == "up" {
@@ -435,15 +464,61 @@ func (e *Exporter) extractInfoMetrics(info, addr string, alias string, scrapes c
 			continue
 		}
 
-		if slaveOffset, slaveIp, slaveState, ok := parseConnectedSlaveString(split[0], split[1]); ok {
-			e.metricsMtx.RLock()
-			e.metrics["connected_slave_offset"].WithLabelValues(
-				addr,
-				alias,
-				slaveIp,
-				slaveState,
-			).Set(slaveOffset)
-			e.metricsMtx.RUnlock()
+		var err3 error
+		var err4 error
+		if split[0] == "master_repl_offset" {
+			if master_repl_offset, err3 = strconv.ParseInt(split[1], 10, 64); err3 != nil {
+				master_repl_offset = 0
+			}
+		}
+
+		if split[0] == "repl_backlog_size" && isMaster {
+			if repl_backlog_size, err4 = strconv.ParseInt(split[1], 10, 64); err4 != nil {
+				repl_backlog_size = 0
+			}
+			if master_repl_offset!=0 && repl_backlog_size!=0 && len(slaveOffsetArray)>0 {
+				var minOffset float64 = float64(slaveOffsetArray[0])
+				for _, offset := range slaveOffsetArray {
+					if minOffset > float64(offset) {
+						minOffset = float64(offset)
+					}
+				}
+				tmpval := float64(master_repl_offset) - minOffset
+				tmpval = tmpval/float64(repl_backlog_size)
+				//log.Printf("master_repl_offset:%v, repl_backlog_size:%v offsetArray:%v, minOffset:%v",
+				//	master_repl_offset, repl_backlog_size, slaveOffsetArray, minOffset)
+				scrapes <- scrapeResult{Name: "repl_backlog_util", Addr: addr, Alias: "repl_backlog_util", Value: tmpval}
+			}
+			var maxSlaveLag float64 = 0.0
+			if len(slaveLagArray) > 0 {
+				maxSlaveLag = slaveLagArray[0]
+				for _, sLag := range slaveLagArray {
+					if maxSlaveLag < sLag {
+						maxSlaveLag = sLag
+					}
+				}
+			}
+			scrapes <- scrapeResult{Name: "repl_slave_max_lag", Addr: addr, Alias: "repl_slave_max_lag", Value: maxSlaveLag}
+		}
+
+
+		var ok bool
+		var lag float64
+		if matched, _ := regexp.MatchString(`^slave\d+`, split[0]); matched {
+			if slaveOffsetTmp, slaveIp, slaveState, lag, ok = parseConnectedSlaveString(split[0], split[1]); ok {
+				e.metricsMtx.RLock()
+				e.metrics["connected_slave_offset"].WithLabelValues(
+						addr,
+						alias,
+						slaveIp,
+						slaveState,
+						).Set(slaveOffsetTmp)
+				e.metricsMtx.RUnlock()
+				slaveLagArray = append(slaveLagArray, lag)
+				if slaveOffsetTmp > 0.0 {
+					slaveOffsetArray = append(slaveOffsetArray, slaveOffsetTmp)
+				}
+			}
 		}
 
 		if len(split) != 2 || !includeMetric(split[0]) {
@@ -510,6 +585,9 @@ func (e *Exporter) extractInfoMetrics(info, addr string, alias string, scrapes c
 			val = 1
 
 		case "fail":
+			val = 0
+
+		case "err":
 			val = 0
 
 		default:
